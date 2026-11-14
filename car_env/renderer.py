@@ -77,7 +77,6 @@ class Renderer:
         return True
 
     def draw_population(self, cars, hud_lines, title=""):
-        """cars: list of (pos, angle) tuples — one per simultaneous car."""
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 pygame.quit()
@@ -102,5 +101,5 @@ class Renderer:
         self.screen.blit(title_font.render(title, True, (255, 60, 60)), (20, 20))
 
         pygame.display.flip()
-        self.clock.tick(30)
+        self.clock.tick(60)   # was 30 — smoother render cadence
         return True

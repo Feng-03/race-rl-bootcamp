@@ -2,15 +2,19 @@ import os
 import glob
 import random
 import torch
-from car_env.env import RaceEnv
+import numpy as np
+from car_env.batch_env import BatchRaceEnv
 from car_env.renderer import Renderer
 from car_env.agent import DQNAgent
 
 N_CARS = 100
 SWITCH_TRACK_EVERY = 500
+RANDOM_TRACK_PROB_ON_SWITCH = 0.6   # how often a switch goes to a brand-new random track vs a fixed one
+STEPS_PER_FRAME = 3
+DISPLAY_SMOOTHING = 0.4
 
 RUNS_DIR = "runs"
-CHECKPOINT_FILE = os.path.join(RUNS_DIR, "checkpoint.pt")
+CHECKPOINT_FILE = os.path.join(RUNS_DIR, "checkpoint_population.pt")
 QNET_FILE = os.path.join(RUNS_DIR, "q_net.pt")
 os.makedirs(RUNS_DIR, exist_ok=True)
 
@@ -18,12 +22,10 @@ track_files = sorted(glob.glob("tracks/waypoints*.json"))
 if not track_files:
     raise FileNotFoundError("No tracks/waypoints*.json files found — draw at least one track first.")
 
-current_track_idx = 0
-current_file = track_files[current_track_idx]
+env = BatchRaceEnv(n_cars=N_CARS, track_files=track_files)
+agent = DQNAgent(obs_dim=env.OBS_DIM, n_actions=env.N_ACTIONS)
 
-envs = [RaceEnv(track_files=[current_file]) for _ in range(N_CARS)]
-agent = DQNAgent(obs_dim=envs[0].observation_space.shape[0], n_actions=envs[0].N_ACTIONS)
-
+current_track_idx = track_files.index(env.current_track_file) if env.current_track_file in track_files else 0
 episodes_so_far = 0
 total_resets = 0
 best_progress_frac = 0.0
@@ -37,56 +39,75 @@ if os.path.exists(CHECKPOINT_FILE):
     agent.train_steps = ckpt["train_steps"]
     episodes_so_far = ckpt["episodes_so_far"]
     best_progress_frac = ckpt["best_progress_frac"]
-    print(f"Resumed from checkpoint: {episodes_so_far} episodes already trained")
+    print(f"Resumed from population checkpoint: {episodes_so_far} episodes already trained")
+elif os.path.exists(QNET_FILE):
+    agent.q_net.load_state_dict(torch.load(QNET_FILE, weights_only=True))
+    agent.target_net.load_state_dict(agent.q_net.state_dict())
+    print("No population checkpoint found — bootstrapped from existing q_net.pt")
+else:
+    print("No checkpoint or q_net.pt found — starting completely fresh")
 
-obs_list = [env.reset()[0] for env in envs]
-renderer = Renderer(envs[0].track)
+obs = env.get_obs_all()
+renderer = Renderer(env.track)
+
+display_pos = env.pos.copy()
+display_angle = env.angle.copy()
 
 running = True
 while running:
     epsilon = max(0.05, 1.0 - episodes_so_far / 1800)
 
-    for i, env in enumerate(envs):
-        action = agent.act(obs_list[i], epsilon)
-        total_actions += 1
-        if random.random() < epsilon:
-            exploration_actions += 1
+    for _ in range(STEPS_PER_FRAME):
+        actions = agent.act_batch(obs, epsilon)
+        exploration_actions += int(np.sum(np.random.rand(N_CARS) < epsilon))
+        total_actions += N_CARS
 
-        next_obs, reward, terminated, truncated, info = env.step(action)
-        agent.store(obs_list[i], action, reward, next_obs, terminated)
+        next_obs, reward, terminated, truncated, off_track = env.step_all(actions)
+        done = terminated | truncated
 
-        if terminated or truncated:
+        for i in range(N_CARS):
+            agent.store(obs[i], actions[i], reward[i], next_obs[i], bool(terminated[i]))
+        agent.train_step()
+
+        done_idx = np.where(done)[0]
+        for i in done_idx:
             episodes_so_far += 1
             total_resets += 1
-            best_progress_frac = max(best_progress_frac, env.progress / env.track.N_PTS)
-            obs_list[i], _ = env.reset()
-        else:
-            obs_list[i] = next_obs
+            best_progress_frac = max(best_progress_frac, env.progress[i] / env.track.N_PTS)
+            env.reset_one(i)
+            display_pos[i] = env.pos[i]
+            display_angle[i] = env.angle[i]
 
-    agent.train_step()
+        obs = env.get_obs_all()
 
-    if total_resets >= SWITCH_TRACK_EVERY:
-        total_resets = 0
-        current_track_idx = (current_track_idx + 1) % len(track_files)
-        current_file = track_files[current_track_idx]
-        for idx, env in enumerate(envs):
-            env.track_files = [current_file]
-            obs_list[idx], _ = env.reset()
-        renderer.update_track(envs[0].track)
+        if total_resets >= SWITCH_TRACK_EVERY:
+            total_resets = 0
+            if random.random() < RANDOM_TRACK_PROB_ON_SWITCH:
+                env.set_track(random_seed=random.randint(0, 2**31 - 1))
+            else:
+                current_track_idx = (current_track_idx + 1) % len(track_files)
+                env.set_track(track_files[current_track_idx])
+            env.reset_all()
+            obs = env.get_obs_all()
+            display_pos = env.pos.copy()
+            display_angle = env.angle.copy()
+            renderer.update_track(env.track)
+
+    display_pos += (env.pos - display_pos) * DISPLAY_SMOOTHING
+    display_angle += (env.angle - display_angle) * DISPLAY_SMOOTHING
 
     exploration_pct = 100 * exploration_actions / max(1, total_actions)
     hud = [f"Episodes: {episodes_so_far}", f"Epsilon: {epsilon:.2f}",
            f"Best: {best_progress_frac*100:.0f}%", f"Exploration: {exploration_pct:.0f}%",
-           f"Track: {current_file}"]
-    cars = [(env.pos, env.angle) for env in envs]
+           f"Track: {env.current_track_file}"]
+    cars = list(zip(display_pos.tolist(), display_angle.tolist()))
     running = renderer.draw_population(cars, hud, title=f"{N_CARS} cars")
 
     if episodes_so_far % 100 < N_CARS:
-        float_best = float(best_progress_frac)  # ensure plain python float, not numpy
         torch.save({
             "q_net": agent.q_net.state_dict(), "target_net": agent.target_net.state_dict(),
             "optimizer": agent.optimizer.state_dict(), "train_steps": agent.train_steps,
-            "episodes_so_far": episodes_so_far, "best_progress_frac": float_best,
+            "episodes_so_far": episodes_so_far, "best_progress_frac": float(best_progress_frac),
         }, CHECKPOINT_FILE)
         torch.save(agent.q_net.state_dict(), QNET_FILE)
 

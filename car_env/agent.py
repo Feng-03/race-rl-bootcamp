@@ -62,6 +62,17 @@ class DQNAgent:
             obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
             return int(self.q_net(obs_t).argmax(dim=1).item())
 
+    def act_batch(self, obs_batch, epsilon):
+        """obs_batch: (N, obs_dim) array. Returns (N,) int array of actions —
+        ONE forward pass for the whole batch instead of N separate calls."""
+        n = len(obs_batch)
+        with torch.no_grad():
+            obs_t = torch.tensor(obs_batch, dtype=torch.float32, device=self.device)
+            greedy = self.q_net(obs_t).argmax(dim=1).cpu().numpy()
+        random_mask = np.random.rand(n) < epsilon
+        random_actions = np.random.randint(0, self.n_actions, size=n)
+        return np.where(random_mask, random_actions, greedy)
+
     def store(self, s, a, r, s2, done):
         self.buffer.push(s, a, r, s2, done)
 
@@ -78,7 +89,8 @@ class DQNAgent:
 
         q_values = self.q_net(s).gather(1, a.unsqueeze(1)).squeeze(1)
         with torch.no_grad():
-            next_q = self.target_net(s2).max(dim=1)[0]
+            next_actions = self.q_net(s2).argmax(dim=1)
+            next_q = self.target_net(s2).gather(1, next_actions.unsqueeze(1)).squeeze(1)
             target = r + self.gamma * (1 - d) * next_q
 
         loss = nn.functional.smooth_l1_loss(q_values, target)

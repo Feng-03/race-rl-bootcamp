@@ -12,24 +12,38 @@ class RaceEnv(gym.Env):
     DT = 0.1
     MAX_SPEED = 14.0
     MAX_STEPS = 1000
-    N_ACTIONS = 4
+    N_ACTIONS = 6
+    STEER_SIGN = {0: -1, 1: -1, 2: 1, 3: 1}
+    SMOOTHNESS_PENALTY = 0.1
+    CENTER_BONUS = 0.5     # up to +50% reward on progress made while centered; 0% bonus at the wall
+    TIME_COST = 0.03        # per-step cost — makes lingering/slow laps genuinely costly
 
-    def __init__(self, track_files=None):
+    def __init__(self, track_files=None, random_track_prob=0.85):
         super().__init__()
-        self.track_files = track_files or sorted(glob.glob("tracks/waypoints*.json"))
-        if not self.track_files:
-            raise FileNotFoundError("No tracks/waypoints*.json files found — draw at least one track first.")
+        self.track_files = track_files if track_files is not None else sorted(glob.glob("tracks/waypoints*.json"))
+        self.random_track_prob = random_track_prob
+        if not self.track_files and self.random_track_prob < 1.0:
+            self.random_track_prob = 1.0
 
-        self.track = Track(random.choice(self.track_files))
+        self._pick_new_track()
 
         self.observation_space = spaces.Box(
             low=0.0, high=1.0, shape=(len(self.RAY_ANGLES_DEG) + 1,), dtype=np.float32
         )
         self.action_space = spaces.Discrete(self.N_ACTIONS)
 
+    def _pick_new_track(self):
+        if self.track_files and random.random() > self.random_track_prob:
+            self.current_track_file = random.choice(self.track_files)
+            self.track = Track(waypoints_file=self.current_track_file)
+        else:
+            seed = random.randint(0, 2**31 - 1)
+            self.current_track_file = f"random:{seed}"
+            self.track = Track(random_seed=seed)
+
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        self.track = Track(random.choice(self.track_files))
+        self._pick_new_track()
 
         self.pos = self.track.centerline[0].copy()
         start_tangent = self.track.centerline[1] - self.track.centerline[0]
@@ -38,17 +52,22 @@ class RaceEnv(gym.Env):
         self.steps = 0
         self.prev_idx = 0
         self.progress = 0
+        self.prev_action = None
         self.trail = [self.pos.copy()]
         return self._get_obs(), {}
 
     def step(self, action):
         if action == 0:
-            self.angle += 3
+            self.angle += 6
         elif action == 1:
-            self.angle -= 3
+            self.angle += 3
         elif action == 2:
-            self.speed = max(1.0, self.speed - 1.0)
+            self.angle -= 3
         elif action == 3:
+            self.angle -= 6
+        elif action == 4:
+            self.speed = max(1.0, self.speed - 1.0)
+        elif action == 5:
             self.speed = min(self.MAX_SPEED, self.speed + 1.0)
 
         rad = np.radians(self.angle)
@@ -64,7 +83,19 @@ class RaceEnv(gym.Env):
         off_track = dist > self.track.HALF_WIDTH
         lap_done = self.progress >= self.track.N_PTS
 
-        reward = delta * 0.3 - 0.01
+        # Centering only pays out as a MULTIPLIER on real progress — zero progress means
+        # zero bonus regardless of position, which removes the "linger near center/go fast
+        # in place" exploit. TIME_COST makes every step genuinely cost something, so slow,
+        # cautious laps can no longer out-score fast, confident ones.
+        center_multiplier = 1.0 + self.CENTER_BONUS * max(0.0, 1.0 - dist / self.track.HALF_WIDTH)
+        reward = delta * 0.3 * center_multiplier - self.TIME_COST
+
+        cur_sign = self.STEER_SIGN.get(action, 0)
+        prev_sign = self.STEER_SIGN.get(self.prev_action, 0)
+        if cur_sign != 0 and prev_sign != 0 and cur_sign != prev_sign:
+            reward -= self.SMOOTHNESS_PENALTY
+        self.prev_action = action
+
         if off_track:
             reward = -10.0
         elif lap_done:
